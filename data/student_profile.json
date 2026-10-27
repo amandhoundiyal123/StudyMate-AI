@@ -1,0 +1,174 @@
+{
+  "xp": 235,
+  "study_days": [
+    "2026-10-26"
+  ],
+  "completed_activities": [
+    "quiz_attempt_001",
+    "quiz_attempt_002",
+    "test_quiz_run_6575",
+    "test_quiz_run_6684",
+    "test_quiz_run_7198",
+    "test_quiz_run_7464"
+  ],
+  "quiz_attempts": [
+    {
+      "id": "quiz_attempt_001",
+      "session_id": "test_session_1",
+      "topic": "Photosynthesis",
+      "total_questions": 2,
+      "correct_count": 2,
+      "score_percent": 100,
+      "timestamp": "2026-10-26T06:32:33.925Z",
+      "is_comeback": false,
+      "wrong_questions": []
+    },
+    {
+      "id": "quiz_attempt_002",
+      "session_id": "test_session_1",
+      "topic": "Photosynthesis",
+      "total_questions": 2,
+      "correct_count": 1,
+      "score_percent": 50,
+      "timestamp": "2026-10-26T06:32:46.804Z",
+      "is_comeback": false,
+      "wrong_questions": [
+        {
+          "id": "q2",
+          "question": "What is split during light reactions?",
+          "selected_option_id": "A",
+          "selected_option_text": "",
+          "correct_option_id": "B",
+          "correct_option_text": "Water",
+          "explanation": "Water is split to release oxygen."
+        }
+      ]
+    },
+    {
+      "id": "test_quiz_run_6575",
+      "session_id": null,
+      "topic": "Cellular Respiration",
+      "total_questions": 1,
+      "correct_count": 1,
+      "score_percent": 100,
+      "timestamp": "2026-10-26T09:36:18.274506",
+      "is_comeback": false,
+      "wrong_questions": []
+    },
+    {
+      "id": "test_quiz_run_6684",
+      "session_id": null,
+      "topic": "Cellular Respiration",
+      "total_questions": 1,
+      "correct_count": 1,
+      "score_percent": 100,
+      "timestamp": "2026-10-26T09:38:28.539774",
+      "is_comeback": false,
+      "wrong_questions": []
+    },
+    {
+      "id": "test_quiz_run_7198",
+      "session_id": null,
+      "topic": "Cellular Respiration",
+      "total_questions": 1,
+      "correct_count": 1,
+      "score_percent": 100,
+      "timestamp": "2026-10-26T09:43:17.652928",
+      "is_comeback": false,
+      "wrong_questions": []
+    },
+    {
+      "id": "test_quiz_run_7464",
+      "session_id": null,
+      "topic": "Cellular Respiration",
+      "total_questions": 1,
+      "correct_count": 1,
+      "score_percent": 100,
+      "timestamp": "2026-10-26T10:26:29.537591",
+      "is_comeback": false,
+      "wrong_questions": []
+    }
+  ],
+  "badges": [
+    {
+      "id": "first_steps",
+      "title": "First Steps",
+      "description": "Complete your first quiz to kickstart your study journey.",
+      "icon": "\ud83d\udc63",
+      "unlocked": true,
+      "unlocked_at": "Oct 26, 2026"
+    },
+    {
+      "id": "quiz_explorer",
+      "title": "Quiz Explorer",
+      "description": "Complete 10 knowledge quizzes across any topics.",
+      "icon": "\ud83e\udded",
+      "unlocked": false,
+      "unlocked_at": null
+    },
+    {
+      "id": "perfect_recall",
+      "title": "Perfect Recall",
+      "description": "Score a perfect 100% on any knowledge quiz.",
+      "icon": "\ud83c\udfaf",
+      "unlocked": true,
+      "unlocked_at": "Oct 26, 2026"
+    },
+    {
+      "id": "comeback",
+      "title": "Comeback",
+      "description": "Improve upon a previous quiz score on a topic.",
+      "icon": "\u26a1",
+      "unlocked": false,
+      "unlocked_at": null
+    },
+    {
+      "id": "consistent_learner",
+      "title": "Consistent Learner",
+      "description": "Study and revise across 5 different days.",
+      "icon": "\ud83d\udcc5",
+      "unlocked": false,
+      "unlocked_at": null
+    },
+    {
+      "id": "topic_master",
+      "title": "Topic Master",
+      "description": "Demonstrate strong performance (>= 80% average over at least 2 quizzes) on a topic.",
+      "icon": "\ud83d\udc51",
+      "unlocked": true,
+      "unlocked_at": "Oct 26, 2026"
+    }
+  ],
+  "topic_mastery": {
+    "Photosynthesis": {
+      "topic": "Photosynthesis",
+      "total_quizzes": 2,
+      "total_questions": 4,
+      "total_correct": 3,
+      "average_score": 75,
+      "status": "Improving",
+      "last_attempt_date": "2026-10-26",
+      "wrong_questions": [
+        {
+          "id": "q2",
+          "question": "What is split during light reactions?",
+          "selected_option_id": "A",
+          "selected_option_text": "",
+          "correct_option_id": "B",
+          "correct_option_text": "Water",
+          "explanation": "Water is split to release oxygen."
+        }
+      ]
+    },
+    "Cellular Respiration": {
+      "topic": "Cellular Respiration",
+      "total_quizzes": 4,
+      "total_questions": 4,
+      "total_correct": 4,
+      "average_score": 100,
+      "status": "Strong",
+      "last_attempt_date": "2026-10-26",
+      "wrong_questions": []
+    }
+  }
+}

@@ -1,0 +1,1094 @@
+import express, { Request, Response } from 'express';
+import multer from 'multer';
+import dotenv from 'dotenv';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { PDFParse } from 'pdf-parse';
+import { GoogleGenAI } from '@google/genai';
+import {
+  getLevelInfo,
+  calculateQuizXp,
+  calculateTopicMasteryStatus,
+} from './src/utils/gamification';
+
+dotenv.config();
+
+const app = express();
+const port = parseInt(process.env.PORT || '3000', 10);
+const upload = multer({ limits: { fileSize: 30 * 1024 * 1024 } }); // 30MB max
+
+app.use(express.json({ limit: '30mb' }));
+app.use(express.urlencoded({ extended: true, limit: '30mb' }));
+
+// Fast Multi-Model AI Engine
+// gemini-3.1-flash-lite delivers ~1.3s generation with zero-thinking budget.
+// Automatic fallback chain ensures high reliability if demand spikes occur.
+const PRIMARY_FAST_MODEL = 'gemini-3.1-flash-lite';
+const FALLBACK_MODELS = ['gemini-flash-latest', 'gemma-4-26b-a4b-it'];
+
+function getAiClient() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  return new GoogleGenAI({ apiKey });
+}
+
+// In-Memory Caches for near-instant responses
+const qaCache = new Map<string, any>();
+const flashcardsCache = new Map<string, any>();
+
+async function callAiWithFastFallback(params: {
+  prompt: string;
+  isJson?: boolean;
+}): Promise<{ text: string; modelUsed: string }> {
+  const ai = getAiClient();
+  if (!ai) {
+    throw new Error('GEMINI_API_KEY is not configured in the backend environment.');
+  }
+
+  const modelsToTry = [PRIMARY_FAST_MODEL, ...FALLBACK_MODELS];
+  let lastError: any = null;
+
+  for (const model of modelsToTry) {
+    try {
+      const config: any = {};
+      // Set zero thinking budget for minimal latency
+      if (model.includes('flash') || model.includes('gemini')) {
+        config.thinkingConfig = { thinkingBudget: 0 };
+      }
+      if (params.isJson) {
+        config.responseMimeType = 'application/json';
+      }
+
+      const response = await ai.models.generateContent({
+        model,
+        contents: params.prompt,
+        config: Object.keys(config).length > 0 ? config : undefined,
+      });
+
+      return {
+        text: response.text?.trim() || '',
+        modelUsed: model,
+      };
+    } catch (err: any) {
+      console.warn(`[FastAI] Model ${model} failed (${err.message}). Trying fallback...`);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('All AI models failed to respond.');
+}
+
+
+// In-Memory Session Store
+interface Chunk {
+  id: string;
+  document_name: string;
+  page_number: number;
+  chunk_index: number;
+  text: string;
+  word_count: number;
+}
+
+interface SourceCitation {
+  chunk_id: string;
+  document_name: string;
+  page_number: number;
+  passage: string;
+  relevance_score: number;
+}
+
+interface StoredQuizRecord {
+  id: string;
+  question: string;
+  options: { id: string; text: string }[];
+  correct_option_id: string;
+  correct_option_text: string;
+  explanation: string;
+  source_citation: SourceCitation;
+}
+
+interface StudySession {
+  session_id: string;
+  topic: string;
+  document_name: string;
+  total_pages: number;
+  chunks: Chunk[];
+  created_at: number;
+  quizzes: Record<string, Record<string, StoredQuizRecord>>;
+}
+
+const sessions = new Map<string, StudySession>();
+
+// Comprehensive English stopwords to isolate topical keywords
+const STOPWORDS = new Set([
+  'a', 'about', 'above', 'according', 'after', 'again', 'against', 'all', 'am', 'an', 'and',
+  'any', 'are', "aren't", 'as', 'at', 'be', 'because', 'been', 'before', 'being',
+  'below', 'between', 'both', 'but', 'by', 'can', 'cannot', 'could', "couldn't", 'did',
+  'do', 'does', 'doing', 'down', 'during', 'each', 'explain', 'few', 'for',
+  'from', 'further', 'had', 'has', 'have', 'having', 'he', 'her', 'here',
+  'hers', 'herself', 'him', 'himself', 'his', 'how', 'i', 'if', 'in', 'into',
+  'is', 'it', 'its', 'itself', 'just', 'me', 'more', 'most', 'my', 'myself',
+  'no', 'nor', 'not', 'now', 'of', 'off', 'on', 'once', 'only', 'or', 'other',
+  'our', 'ours', 'ourselves', 'out', 'over', 'own', 'same', 'she', 'should',
+  'so', 'some', 'such', 'tell', 'than', 'that', 'the', 'their', 'theirs',
+  'them', 'themselves', 'then', 'there', 'these', 'they', 'this', 'those',
+  'through', 'to', 'too', 'under', 'until', 'up', 'very', 'was', 'we', 'were',
+  'what', 'when', 'where', 'which', 'while', 'who', 'whom', 'why', 'will', 'with',
+  'would', 'you', 'your', 'yours', 'yourself', 'yourselves', 'give', 'detail',
+  'describe', 'define', 'list', 'state', 'mention', 'summarize', 'please', 'briefly'
+]);
+
+function extractKeywords(text: string): string[] {
+  const tokens = text.toLowerCase().match(/\b[a-z0-9_-]{2,}\b/g) || [];
+  const filtered = tokens.filter((t) => !STOPWORDS.has(t) && t.length > 2);
+  return filtered.length > 0 ? filtered : tokens;
+}
+
+function scoreChunk(keywords: string[], chunkText: string, rawQuery: string): { score: number; matches: number } {
+  if (keywords.length === 0) return { score: 0, matches: 0 };
+  const chunkLower = chunkText.toLowerCase();
+
+  let matches = 0;
+  let totalTermFreq = 0;
+
+  for (const kw of keywords) {
+    // Exact word boundary matching for keywords to avoid accidental substrings
+    const regex = new RegExp(`\\b${kw}\\b`, 'gi');
+    const count = (chunkLower.match(regex) || []).length;
+    if (count > 0) {
+      matches++;
+      totalTermFreq += count;
+    }
+  }
+
+  if (matches === 0) return { score: 0, matches: 0 };
+
+  const coverage = matches / keywords.length;
+  const tf = Math.log1p(totalTermFreq);
+  let phraseBonus = 0;
+  const cleanRaw = rawQuery.toLowerCase().replace(/[^\w\s]/g, '').trim();
+  if (cleanRaw.split(/\s+/).length > 1 && chunkLower.includes(cleanRaw)) {
+    phraseBonus = 0.5;
+  }
+
+  const score = coverage * 0.7 + Math.min(tf, 2.0) * 0.2 + phraseBonus;
+  return { score, matches };
+}
+
+function retrievePassages(
+  chunks: Chunk[],
+  query: string,
+  topK: number = 3
+): { sources: SourceCitation[]; evidenceStatus: 'Supported' | 'Partially Supported' | 'Not Found' | 'Out of Syllabus' } {
+  if (chunks.length === 0) return { sources: [], evidenceStatus: 'Out of Syllabus' };
+  const keywords = extractKeywords(query);
+  if (keywords.length === 0) return { sources: [], evidenceStatus: 'Out of Syllabus' };
+
+  const scored = [];
+  for (const chunk of chunks) {
+    const { score, matches } = scoreChunk(keywords, chunk.text, query);
+    // Stricter relevance threshold: must match meaningful keywords
+    if (score >= 0.35 && matches >= 1) {
+      scored.push({
+        score,
+        matches,
+        citation: {
+          chunk_id: chunk.id,
+          document_name: chunk.document_name,
+          page_number: chunk.page_number,
+          passage: chunk.text,
+          relevance_score: Math.round(score * 100) / 100,
+        },
+      });
+    }
+  }
+
+  if (scored.length === 0) {
+    return { sources: [], evidenceStatus: 'Out of Syllabus' };
+  }
+
+  scored.sort((a, b) => b.score - a.score || b.matches - a.matches);
+  const topScore = scored[0].score;
+  const topMatches = scored[0].matches;
+  const coverage = topMatches / keywords.length;
+
+  // Stricter coverage requirement to protect against Out of Syllabus questions
+  if (topScore >= 0.70 || (coverage >= 0.6 && topMatches >= 2)) {
+    return { sources: scored.slice(0, topK).map((s) => s.citation), evidenceStatus: 'Supported' };
+  } else if (topScore >= 0.40 && (coverage >= 0.4 || topMatches >= 2)) {
+    return { sources: scored.slice(0, topK).map((s) => s.citation), evidenceStatus: 'Partially Supported' };
+  }
+
+  // If score is weak or only matched 1 weak term among many, classify as Out of Syllabus
+  return { sources: [], evidenceStatus: 'Out of Syllabus' };
+}
+
+function splitTextIntoChunks(
+  text: string,
+  documentName: string,
+  pageNumber: number,
+  startIndex: number
+): Chunk[] {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
+  const words = clean.split(' ');
+  if (words.length <= 200) {
+    return [
+      {
+        id: `c_${startIndex}`,
+        document_name: documentName,
+        page_number: pageNumber,
+        chunk_index: startIndex,
+        text: clean,
+        word_count: words.length,
+      },
+    ];
+  }
+
+  const chunks: Chunk[] = [];
+  const chunkSize = 180;
+  const overlap = 35;
+  let i = 0;
+  let currentIndex = startIndex;
+
+  while (i < words.length) {
+    const chunkWords = words.slice(i, i + chunkSize);
+    chunks.push({
+      id: `c_${currentIndex}`,
+      document_name: documentName,
+      page_number: pageNumber,
+      chunk_index: currentIndex,
+      text: chunkWords.join(' '),
+      word_count: chunkWords.length,
+    });
+    currentIndex++;
+    i += chunkSize - overlap;
+  }
+
+  return chunks;
+}
+
+// API Routes
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({
+    status: 'healthy',
+    service: 'StudyMate AI Full-Stack Server',
+    team: 'Cognify',
+  });
+});
+
+app.post('/upload-notes', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    const file = req.file;
+    const bodyText = (req.body?.text || '').trim();
+    const topic = (req.body?.topic || '').trim() || 'General Study Notes';
+
+    if (!file && !bodyText) {
+      res.status(400).json({ detail: 'Please provide either a PDF file or paste text notes to begin studying.' });
+      return;
+    }
+
+    let chunks: Chunk[] = [];
+    let documentName = 'Study Notes';
+    let totalPages = 1;
+
+    if (file) {
+      documentName = file.originalname || 'document.pdf';
+      if (!documentName.toLowerCase().endsWith('.pdf')) {
+        res.status(400).json({ detail: 'Unsupported file format. Please upload a standard PDF (.pdf) document.' });
+        return;
+      }
+      if (!file.buffer || file.buffer.length === 0) {
+        res.status(400).json({ detail: 'The uploaded PDF file is empty (0 bytes).' });
+        return;
+      }
+
+      try {
+        const parser = new PDFParse(new Uint8Array(file.buffer));
+        const pdfData = await parser.getText();
+        const pages = pdfData.pages || [];
+
+        if (pages.length === 0 && !pdfData.text) {
+          res.status(400).json({ detail: 'The uploaded PDF has 0 readable pages.' });
+          return;
+        }
+
+        if (pages.length > 0) {
+          totalPages = pages.length;
+          pages.forEach((pageObj: any, idx: number) => {
+            const pageText = (pageObj.text || '').trim();
+            if (pageText) {
+              const pageChunks = splitTextIntoChunks(pageText, documentName, idx + 1, chunks.length + 1);
+              chunks.push(...pageChunks);
+            }
+          });
+        } else if (pdfData.text) {
+          chunks = splitTextIntoChunks(pdfData.text, documentName, 1, 1);
+        }
+
+        if (chunks.length === 0) {
+          res.status(400).json({
+            detail: 'No readable text could be extracted from this PDF. Please ensure it is not a scanned image-only PDF.',
+          });
+          return;
+        }
+      } catch (err: any) {
+        res.status(400).json({ detail: `Corrupted or invalid PDF file: ${err.message}` });
+        return;
+      }
+    } else if (bodyText) {
+      documentName = 'Pasted Study Notes';
+      const words = bodyText.split(/\s+/);
+      if (words.length < 15) {
+        res.status(400).json({ detail: 'Pasted notes are too short. Please provide at least 15 words of study material.' });
+        return;
+      }
+
+      const wordsPerPage = 350;
+      let chunkCounter = 1;
+      for (let pIdx = 0; pIdx < Math.ceil(words.length / wordsPerPage); pIdx++) {
+        const pageNum = pIdx + 1;
+        const pageWords = words.slice(pIdx * wordsPerPage, (pIdx + 1) * wordsPerPage);
+        const pageChunks = splitTextIntoChunks(pageWords.join(' '), documentName, pageNum, chunkCounter);
+        chunks.push(...pageChunks);
+        chunkCounter += pageChunks.length;
+      }
+      totalPages = Math.max(...chunks.map((c) => c.page_number), 1);
+    }
+
+    const sessionId = crypto.randomUUID();
+    const newSession: StudySession = {
+      session_id: sessionId,
+      topic,
+      document_name: documentName,
+      total_pages: totalPages,
+      chunks,
+      created_at: Date.now(),
+      quizzes: {},
+    };
+
+    sessions.set(sessionId, newSession);
+
+    res.json({
+      session_id: sessionId,
+      topic,
+      document_name: documentName,
+      total_pages: totalPages,
+      total_chunks: chunks.length,
+      message: `Successfully processed ${chunks.length} study passages from ${documentName}.`,
+      preview_chunks: chunks.slice(0, 3),
+    });
+  } catch (err: any) {
+    res.status(500).json({ detail: `Internal server error: ${err.message}` });
+  }
+});
+
+app.post('/ask-question', async (req: Request, res: Response) => {
+  try {
+    const { session_id, question } = req.body || {};
+    if (!session_id || !question?.trim()) {
+      res.status(400).json({ detail: 'session_id and non-empty question are required.' });
+      return;
+    }
+
+    const session = sessions.get(session_id);
+    if (!session) {
+      res.status(404).json({ detail: 'Study session not found or expired. Please upload your notes again.' });
+      return;
+    }
+
+    const cleanQuestion = question.trim();
+    const cacheKey = `${session_id}:${cleanQuestion.toLowerCase()}`;
+    if (qaCache.has(cacheKey)) {
+      res.json(qaCache.get(cacheKey));
+      return;
+    }
+
+    const { sources, evidenceStatus } = retrievePassages(session.chunks, cleanQuestion, 3);
+
+    // Rule 1: If passage retrieval detects Out of Syllabus or Not Found, strictly reject
+    if (evidenceStatus === 'Out of Syllabus' || evidenceStatus === 'Not Found' || sources.length === 0) {
+      const outResult = {
+        session_id,
+        question: cleanQuestion,
+        answer:
+          'Out of Syllabus: This question is not covered in your uploaded study notes or PDF document. StudyMate AI strictly prevents answering outside of your provided curriculum.',
+        evidence_status: 'Out of Syllabus',
+        sources: [],
+      };
+      qaCache.set(cacheKey, outResult);
+      res.json(outResult);
+      return;
+    }
+
+    const evidenceText = sources
+      .map(
+        (src, idx) =>
+          `[Source ${idx + 1} - Page ${src.page_number} (${src.document_name})]:\n"${src.passage}"`
+      )
+      .join('\n\n');
+
+    const prompt = `You are StudyMate AI, an honest academic assistant built by Team Cognify.
+CRITICAL SYLLABUS GROUNDING RULE:
+- You must answer ONLY if the provided Source Passages explicitly contain the factual information to answer the student's question.
+- If the student's question is OUT OF SYLLABUS, unrelated to the excerpts, or cannot be fully and accurately answered using ONLY the provided excerpts, you MUST respond with EXACTLY:
+OUT_OF_SYLLABUS
+- NEVER use external knowledge, never extrapolate, and never guess.
+- If the passages DO contain the answer, provide a clear, helpful response citing the exact page number (e.g. "According to Page X..."). Keep your explanation direct and concise (under 3 sentences).
+
+Topic: ${session.topic}
+
+--- PROVIDED SOURCE PASSAGES ---
+${evidenceText}
+--- END SOURCES ---
+
+Student Question: ${cleanQuestion}
+
+Answer:`;
+
+    const aiRes = await callAiWithFastFallback({ prompt });
+    const answerText = aiRes.text;
+
+    // Check if model flagged out of syllabus or hallucination fallback
+    if (
+      !answerText ||
+      answerText.includes('OUT_OF_SYLLABUS') ||
+      answerText.toLowerCase().includes('not contained in the provided') ||
+      answerText.toLowerCase().includes('not mentioned in the provided')
+    ) {
+      const rejectResult = {
+        session_id,
+        question: cleanQuestion,
+        answer:
+          'Out of Syllabus: This question is not covered in your uploaded study notes or PDF document. StudyMate AI strictly prevents answering outside of your provided curriculum.',
+        evidence_status: 'Out of Syllabus',
+        sources: [],
+      };
+      qaCache.set(cacheKey, rejectResult);
+      res.json(rejectResult);
+      return;
+    }
+
+    const validResult = {
+      session_id,
+      question: cleanQuestion,
+      answer: answerText,
+      evidence_status: evidenceStatus,
+      sources,
+    };
+    qaCache.set(cacheKey, validResult);
+    res.json(validResult);
+  } catch (err: any) {
+    res.status(503).json({ detail: `Inference error with Gemma 4: ${err.message}` });
+  }
+});
+
+app.post('/generate-quiz', async (req: Request, res: Response) => {
+  try {
+    const { session_id, num_questions = 5, difficulty = 'Medium' } = req.body || {};
+    const session = sessions.get(session_id);
+    if (!session) {
+      res.status(404).json({ detail: 'Study session not found or expired.' });
+      return;
+    }
+
+    const ai = getAiClient();
+    if (!ai) {
+      res.status(503).json({ detail: 'GEMINI_API_KEY is not configured in the backend environment.' });
+      return;
+    }
+
+    const requestedCount = Math.min(Math.max(Number(num_questions) || 5, 3), 10);
+    const validDifficulty = ['Easy', 'Medium', 'Hard'].includes(difficulty) ? difficulty : 'Medium';
+
+    const step = Math.max(1, Math.floor(session.chunks.length / Math.min(session.chunks.length, 8)));
+    const sampledPassages = [];
+    for (let i = 0; i < session.chunks.length; i += step) {
+      const c = session.chunks[i];
+      sampledPassages.push(
+        `[Chunk: ${c.id} | Page: ${c.page_number} | Doc: ${c.document_name}]:\n${c.text.slice(0, 500)}`
+      );
+      if (sampledPassages.length >= 8) break;
+    }
+
+    let difficultyInstruction = '';
+    if (validDifficulty === 'Easy') {
+      difficultyInstruction = 'Difficulty: Easy. Focus on direct factual recall, definitions, and key terms stated explicitly in the text.';
+    } else if (validDifficulty === 'Hard') {
+      difficultyInstruction = 'Difficulty: Hard. Create challenging questions requiring analytical deduction, distinguishing subtle conceptual differences, and multi-step reasoning directly grounded in the notes.';
+    } else {
+      difficultyInstruction = 'Difficulty: Medium. Test conceptual comprehension, operational steps, and relationships between concepts in the notes.';
+    }
+
+    const prompt = `You are StudyMate AI, an educational quiz generator.
+Generate exactly ${requestedCount} high-quality multiple choice questions based SOLELY on the study notes below.
+${difficultyInstruction}
+
+Requirements:
+1. Every question must be directly answerable from the provided excerpts.
+2. Provide exactly 4 distinct options labeled 'A', 'B', 'C', 'D' for each question.
+3. Only one option must be correct.
+4. Include an explanation for why the answer is correct.
+5. Specify the exact page number and passage snippet that supports the answer.
+6. Return ONLY valid JSON as an array of objects with this exact structure:
+[
+  {
+    "id": "q1",
+    "question": "Question text here?",
+    "options": [
+      {"id": "A", "text": "Option A text"},
+      {"id": "B", "text": "Option B text"},
+      {"id": "C", "text": "Option C text"},
+      {"id": "D", "text": "Option D text"}
+    ],
+    "correct_option_id": "A",
+    "explanation": "Clear explanation grounded in notes...",
+    "page_number": 1,
+    "passage": "Excerpt from notes supporting this answer"
+  }
+]
+
+Topic: ${session.topic}
+
+Study Notes Excerpts:
+${sampledPassages.join('\n\n')}
+
+JSON output:`;
+
+    const aiRes = await callAiWithFastFallback({ prompt, isJson: true });
+    const raw = aiRes.text;
+    const jsonMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
+    const jsonStr = jsonMatch ? jsonMatch[0] : raw;
+    let items: any[] = [];
+    try {
+      items = JSON.parse(jsonStr);
+    } catch {
+      const cleaned = jsonStr.replace(/,\s*([}\]])/g, '$1');
+      items = JSON.parse(cleaned);
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      res.status(500).json({ detail: 'AI returned an invalid quiz structure.' });
+      return;
+    }
+
+    const quizId = crypto.randomUUID();
+    const storedRecords: Record<string, StoredQuizRecord> = {};
+    const studentQuestions: any[] = [];
+
+    items.slice(0, requestedCount).forEach((item: any, idx: number) => {
+      const qId = `q${idx + 1}`;
+      const correctOptionId = String(item.correct_option_id || 'A').toUpperCase().trim();
+      const options = (item.options || []).map((o: any) => ({
+        id: String(o.id || '').toUpperCase().trim(),
+        text: String(o.text || '').trim(),
+      }));
+
+      const correctOpt = options.find((o: any) => o.id === correctOptionId);
+      const citation: SourceCitation = {
+        chunk_id: `quiz_ref_${qId}`,
+        document_name: session.document_name,
+        page_number: Number(item.page_number) || session.chunks[0].page_number,
+        passage: String(item.passage || session.chunks[0].text.slice(0, 150)).trim(),
+        relevance_score: 1.0,
+      };
+
+      storedRecords[qId] = {
+        id: qId,
+        question: String(item.question).trim(),
+        options,
+        correct_option_id: correctOptionId,
+        correct_option_text: correctOpt?.text || correctOptionId,
+        explanation: String(item.explanation || 'Based on study notes.').trim(),
+        source_citation: citation,
+      };
+
+      // Mask answer key from student
+      studentQuestions.push({
+        id: qId,
+        question: String(item.question).trim(),
+        options,
+      });
+    });
+
+    session.quizzes[quizId] = storedRecords;
+
+    res.json({
+      session_id,
+      quiz_id: quizId,
+      questions: studentQuestions,
+      total_questions: studentQuestions.length,
+      difficulty: validDifficulty,
+    });
+  } catch (err: any) {
+    res.status(503).json({ detail: `Failed to generate quiz: ${err.message}` });
+  }
+});
+
+app.post('/evaluate-answer', (req: Request, res: Response) => {
+  const { session_id, quiz_id, question_id, selected_option_id } = req.body || {};
+  const session = sessions.get(session_id);
+  if (!session) {
+    res.status(404).json({ detail: 'Study session not found or expired.' });
+    return;
+  }
+
+  const quiz = session.quizzes[quiz_id];
+  const qRecord = quiz ? quiz[question_id] : null;
+  if (!qRecord) {
+    res.status(404).json({ detail: 'Quiz or question record not found. Please regenerate the quiz.' });
+    return;
+  }
+
+  const userChoice = String(selected_option_id || '').toUpperCase().trim();
+  const correctChoice = qRecord.correct_option_id.toUpperCase().trim();
+  const isCorrect = userChoice === correctChoice;
+
+  res.json({
+    is_correct: isCorrect,
+    selected_option_id: userChoice,
+    correct_option_id: correctChoice,
+    correct_option_text: qRecord.correct_option_text,
+    explanation: qRecord.explanation,
+    source_citation: qRecord.source_citation,
+  });
+});
+
+app.get('/sessions/:session_id', (req: Request, res: Response) => {
+  const session = sessions.get(req.params.session_id);
+  if (!session) {
+    res.status(404).json({ detail: 'Session not found.' });
+    return;
+  }
+  res.json({
+    session_id: session.session_id,
+    topic: session.topic,
+    document_name: session.document_name,
+    total_pages: session.total_pages,
+    total_chunks: session.chunks.length,
+    created_at: session.created_at,
+  });
+});
+
+// --- STUDENT GAMIFICATION, BADGES & MASTERY STORE ---
+const DATA_DIR = path.join(process.cwd(), 'data');
+const PROFILE_FILE = path.join(DATA_DIR, 'student_profile.json');
+
+const INITIAL_BADGES = [
+  {
+    id: 'first_steps',
+    title: 'First Steps',
+    description: 'Complete your first quiz to kickstart your study journey.',
+    icon: '👣',
+    unlocked: false,
+    unlocked_at: null,
+  },
+  {
+    id: 'quiz_explorer',
+    title: 'Quiz Explorer',
+    description: 'Complete 10 knowledge quizzes across any topics.',
+    icon: '🧭',
+    unlocked: false,
+    unlocked_at: null,
+  },
+  {
+    id: 'perfect_recall',
+    title: 'Perfect Recall',
+    description: 'Score a perfect 100% on any knowledge quiz.',
+    icon: '🎯',
+    unlocked: false,
+    unlocked_at: null,
+  },
+  {
+    id: 'comeback',
+    title: 'Comeback',
+    description: 'Improve upon a previous quiz score on a topic.',
+    icon: '⚡',
+    unlocked: false,
+    unlocked_at: null,
+  },
+  {
+    id: 'consistent_learner',
+    title: 'Consistent Learner',
+    description: 'Study and revise across 5 different days.',
+    icon: '📅',
+    unlocked: false,
+    unlocked_at: null,
+  },
+  {
+    id: 'topic_master',
+    title: 'Topic Master',
+    description: 'Demonstrate strong performance (>= 80% average over at least 2 quizzes) on a topic.',
+    icon: '👑',
+    unlocked: false,
+    unlocked_at: null,
+  },
+];
+
+function loadStudentProfile(): any {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (fs.existsSync(PROFILE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf-8'));
+      const existingBadgeIds = new Set((data.badges || []).map((b: any) => b.id));
+      for (const ib of INITIAL_BADGES) {
+        if (!existingBadgeIds.has(ib.id)) {
+          data.badges.push({ ...ib });
+        }
+      }
+      return data;
+    }
+  } catch (err) {
+    console.error('Error loading student profile, resetting to default:', err);
+  }
+
+  const today = new Date().toISOString().split('T')[0];
+  const initial = {
+    xp: 0,
+    study_days: [today],
+    completed_activities: [],
+    quiz_attempts: [],
+    badges: INITIAL_BADGES,
+    topic_mastery: {},
+  };
+  saveStudentProfile(initial);
+  return initial;
+}
+
+function saveStudentProfile(data: any) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(PROFILE_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Error saving student profile:', err);
+  }
+}
+
+app.get('/student/profile', (_req: Request, res: Response) => {
+  const profile = loadStudentProfile();
+  const level = getLevelInfo(profile.xp);
+  res.json({
+    ...profile,
+    level,
+  });
+});
+
+app.post('/student/record-quiz', (req: Request, res: Response) => {
+  const { session_id, quiz_id, topic, results } = req.body || {};
+  if (!quiz_id) {
+    res.status(400).json({ detail: 'quiz_id is required' });
+    return;
+  }
+
+  const profile = loadStudentProfile();
+
+  // Prevent duplicate XP: if quiz_id is already in completed_activities
+  if (profile.completed_activities.includes(quiz_id)) {
+    const level = getLevelInfo(profile.xp);
+    res.json({
+      profile: { ...profile, level },
+      xp_earned: 0,
+      leveled_up: false,
+      new_badges: [],
+      is_duplicate: true,
+    });
+    return;
+  }
+
+  const totalQuestions = Array.isArray(results) ? results.length : 0;
+  const correctCount = Array.isArray(results)
+    ? results.filter((r: any) => r.evaluation?.is_correct).length
+    : 0;
+
+  const scorePercent = totalQuestions > 0 ? Math.round((correctCount / totalQuestions) * 100) : 0;
+
+  // Check for comeback on this topic
+  const previousAttempts = (profile.quiz_attempts || []).filter(
+    (a: any) => (a.topic || '').toLowerCase() === (topic || '').toLowerCase()
+  );
+  let isComeback = false;
+  if (previousAttempts.length > 0) {
+    const lastScore = previousAttempts[previousAttempts.length - 1].score_percent;
+    if (scorePercent > lastScore) {
+      isComeback = true;
+    }
+  }
+
+  const xpEarned = calculateQuizXp(correctCount, totalQuestions, isComeback);
+  const oldXp = profile.xp;
+  const oldLevel = getLevelInfo(oldXp);
+
+  profile.xp += xpEarned;
+  const newLevel = getLevelInfo(profile.xp);
+  const leveledUp = newLevel.level > oldLevel.level;
+
+  profile.completed_activities.push(quiz_id);
+
+  const today = new Date().toISOString().split('T')[0];
+  if (!profile.study_days.includes(today)) {
+    profile.study_days.push(today);
+  }
+
+  // Record wrong questions for review
+  const wrongQuestions = (results || [])
+    .filter((r: any) => !r.evaluation?.is_correct)
+    .map((r: any) => ({
+      id: r.question?.id || crypto.randomUUID(),
+      question: r.question?.question || '',
+      selected_option_id: r.selected_option_id || '',
+      selected_option_text:
+        r.question?.options?.find((o: any) => o.id === r.selected_option_id)?.text || '',
+      correct_option_id: r.evaluation?.correct_option_id || '',
+      correct_option_text: r.evaluation?.correct_option_text || '',
+      explanation: r.evaluation?.explanation || '',
+      page_number: r.evaluation?.source_citation?.page_number,
+      passage: r.evaluation?.source_citation?.passage,
+    }));
+
+  profile.quiz_attempts.push({
+    id: quiz_id,
+    session_id,
+    topic: topic || 'General Notes',
+    total_questions: totalQuestions,
+    correct_count: correctCount,
+    score_percent: scorePercent,
+    timestamp: new Date().toISOString(),
+    is_comeback: isComeback,
+    wrong_questions: wrongQuestions,
+  });
+
+  // Update Topic Mastery
+  const topicKey = topic || 'General Notes';
+  const existingMastery = profile.topic_mastery[topicKey] || {
+    topic: topicKey,
+    total_quizzes: 0,
+    total_questions: 0,
+    total_correct: 0,
+    average_score: 0,
+    status: 'Insufficient Data',
+    last_attempt_date: today,
+    wrong_questions: [],
+  };
+
+  existingMastery.total_quizzes += 1;
+  existingMastery.total_questions += totalQuestions;
+  existingMastery.total_correct += correctCount;
+  existingMastery.average_score = Math.round(
+    (existingMastery.total_correct / existingMastery.total_questions) * 100
+  );
+  existingMastery.status = calculateTopicMasteryStatus(
+    existingMastery.average_score,
+    existingMastery.total_quizzes
+  );
+  existingMastery.last_attempt_date = today;
+  existingMastery.wrong_questions = [
+    ...wrongQuestions,
+    ...(existingMastery.wrong_questions || []),
+  ].slice(0, 30);
+
+  profile.topic_mastery[topicKey] = existingMastery;
+
+  // Award badges
+  const newBadges: any[] = [];
+  const nowStr = new Date().toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+
+  const totalQuizzes = profile.quiz_attempts.length;
+
+  for (const b of profile.badges) {
+    if (b.unlocked) continue;
+    let shouldUnlock = false;
+
+    if (b.id === 'first_steps' && totalQuizzes >= 1) {
+      shouldUnlock = true;
+    } else if (b.id === 'quiz_explorer' && totalQuizzes >= 10) {
+      shouldUnlock = true;
+    } else if (b.id === 'perfect_recall' && scorePercent === 100) {
+      shouldUnlock = true;
+    } else if (b.id === 'comeback' && isComeback) {
+      shouldUnlock = true;
+    } else if (b.id === 'consistent_learner' && profile.study_days.length >= 5) {
+      shouldUnlock = true;
+    } else if (b.id === 'topic_master') {
+      const isAnyMaster = Object.values(profile.topic_mastery).some(
+        (m: any) => m.total_quizzes >= 2 && m.average_score >= 80
+      );
+      if (isAnyMaster) shouldUnlock = true;
+    }
+
+    if (shouldUnlock) {
+      b.unlocked = true;
+      b.unlocked_at = nowStr;
+      newBadges.push({ ...b });
+    }
+  }
+
+  saveStudentProfile(profile);
+
+  res.json({
+    profile: { ...profile, level: newLevel },
+    xp_earned: xpEarned,
+    leveled_up: leveledUp,
+    new_level: leveledUp ? newLevel : undefined,
+    new_badges: newBadges,
+    is_duplicate: false,
+  });
+});
+
+app.post('/student/record-revision', (req: Request, res: Response) => {
+  const { session_id, topic } = req.body || {};
+  if (!session_id) {
+    res.status(400).json({ detail: 'session_id is required' });
+    return;
+  }
+
+  const profile = loadStudentProfile();
+  const today = new Date().toISOString().split('T')[0];
+  const activityKey = `revision_${session_id}_${today}`;
+
+  if (profile.completed_activities.includes(activityKey)) {
+    const level = getLevelInfo(profile.xp);
+    res.json({
+      profile: { ...profile, level },
+      xp_earned: 0,
+      leveled_up: false,
+      is_duplicate: true,
+    });
+    return;
+  }
+
+  const xpEarned = 25;
+  const oldLevel = getLevelInfo(profile.xp);
+  profile.xp += xpEarned;
+  const newLevel = getLevelInfo(profile.xp);
+  const leveledUp = newLevel.level > oldLevel.level;
+
+  profile.completed_activities.push(activityKey);
+  if (!profile.study_days.includes(today)) {
+    profile.study_days.push(today);
+  }
+
+  saveStudentProfile(profile);
+
+  res.json({
+    profile: { ...profile, level: newLevel },
+    xp_earned: xpEarned,
+    leveled_up: leveledUp,
+    new_level: leveledUp ? newLevel : undefined,
+    is_duplicate: false,
+  });
+});
+
+app.post('/student/flashcards', async (req: Request, res: Response) => {
+  try {
+    const { topic, session_id } = req.body || {};
+    let textToUse = '';
+    let pageNum = 1;
+
+    if (session_id && sessions.has(session_id)) {
+      const s = sessions.get(session_id)!;
+      textToUse = s.chunks.map((c) => c.text).join('\n\n').slice(0, 3000);
+      pageNum = s.chunks[0]?.page_number || 1;
+    } else {
+      for (const s of sessions.values()) {
+        if (s.topic.toLowerCase() === (topic || '').toLowerCase()) {
+          textToUse = s.chunks.map((c) => c.text).join('\n\n').slice(0, 3000);
+          pageNum = s.chunks[0]?.page_number || 1;
+          break;
+        }
+      }
+    }
+
+    if (!textToUse) {
+      textToUse = `Study topic: ${topic}. Focus on key definitions, core concepts, and formulas.`;
+    }
+
+    const ai = getAiClient();
+    if (!ai) {
+      res.status(503).json({ detail: 'AI inference client not configured' });
+      return;
+    }
+
+    const prompt = `You are StudyMate AI flashcard maker.
+Create 5 high-yield study flashcards for the topic: "${topic}".
+Each card has a 'front' (term or key question) and a 'back' (concise clear definition or answer).
+Return ONLY a valid JSON array:
+[
+  {
+    "id": "fc1",
+    "front": "Term or Key Question",
+    "back": "Clear definition or answer grounded in study notes",
+    "page_number": ${pageNum}
+  }
+]
+
+Content excerpts:
+${textToUse}
+
+JSON array:`;
+
+    const cacheKey = (topic || '').trim().toLowerCase();
+    if (cacheKey && flashcardsCache.has(cacheKey)) {
+      res.json({
+        topic,
+        flashcards: flashcardsCache.get(cacheKey),
+      });
+      return;
+    }
+
+    const aiRes = await callAiWithFastFallback({ prompt, isJson: true });
+    const raw = aiRes.text;
+    const jsonMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
+    const jsonStr = jsonMatch ? jsonMatch[0] : raw;
+    let flashcards = [];
+    try {
+      flashcards = JSON.parse(jsonStr);
+    } catch {
+      flashcards = [
+        {
+          id: 'fc1',
+          front: `What is the core principle of ${topic}?`,
+          back: `The fundamental mechanism defined in your notes.`,
+          page_number: pageNum,
+        },
+      ];
+    }
+
+    if (cacheKey && Array.isArray(flashcards) && flashcards.length > 0) {
+      flashcardsCache.set(cacheKey, flashcards);
+    }
+
+    res.json({
+      topic,
+      flashcards,
+    });
+  } catch (err: any) {
+    res.status(500).json({ detail: `Flashcard generation failed: ${err.message}` });
+  }
+});
+
+// Mount Vite middlewares for development frontend
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer } = await import('vite');
+    const vite = await createServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
+
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`StudyMate AI Server running on http://0.0.0.0:${port}`);
+  });
+}
+
+startServer().catch(console.error);

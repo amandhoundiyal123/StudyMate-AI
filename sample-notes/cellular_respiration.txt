@@ -1,0 +1,15 @@
+Cellular Respiration and ATP Production
+
+Cellular respiration is the biochemical process by which organisms combine oxygen with foodstuff molecules, diverting the chemical energy in these substances into life-sustaining activities and discarding, as waste products, carbon dioxide and water.
+
+The overall chemical equation for aerobic respiration is:
+C6H12O6 (glucose) + 6 O2 -> 6 CO2 + 6 H2O + approximately 36 to 38 ATP molecules.
+
+Stage 1: Glycolysis
+Glycolysis occurs in the cytoplasm of the cell and does not require oxygen (it is anaerobic). During glycolysis, one six-carbon molecule of glucose is broken down into two three-carbon molecules of pyruvate. This stage yields a net gain of 2 ATP molecules and 2 NADH molecules through substrate-level phosphorylation.
+
+Stage 2: The Krebs Cycle (Citric Acid Cycle)
+Before entering the Krebs cycle, pyruvate is converted into Acetyl-CoA inside the mitochondrial matrix, producing 1 NADH and releasing 1 CO2 per pyruvate molecule. The Acetyl-CoA then enters the citric acid cycle. For each glucose molecule (2 turns of the cycle), it generates 2 ATP, 6 NADH, 2 FADH2, and releases 4 CO2 molecules.
+
+Stage 3: Oxidative Phosphorylation and Electron Transport Chain (ETC)
+The electron transport chain is located on the inner mitochondrial membrane (cristae). Electrons transferred from NADH and FADH2 move through a series of protein complexes (Complex I, II, III, and IV). As electrons move down the gradient, protons (H+) are pumped from the matrix into the intermembrane space, creating a proton-motive force. Protons flow back through ATP synthase via chemiosmosis to synthesize ATP. Oxygen serves as the final electron acceptor, combining with protons to form water (H2O).
